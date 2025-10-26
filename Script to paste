@@ -1,0 +1,137 @@
+// ==UserScript==
+// @name         Torn Chain Overlay
+// @namespace    anubis.torn.chain.overlay.fixed
+// @version      1.2.0
+// @description  Fixed big red countdown overlay above Chain area. Auto-updates via Torn API and flashes/beeps at 1:30 and 1:00.
+// @match        *://*.torn.com/*
+// @match        *://torn.com/*
+// @run-at       document-idle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const API_KEY_NAME = "torn_api_key";
+  const POLL_SECS = 30;
+  const ALERT_TIMES = [90, 60]; // seconds left (1:30 and 1:00)
+  const FONT_SIZE = 140;
+
+  const MMSS = (secs) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
+  };
+
+  function beep() {
+    try {
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = 660;
+      osc.type = "sine";
+      gain.gain.setValueAtTime(0.1, ctx.currentTime);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.25);
+    } catch (e) {
+      console.warn("Beep failed:", e);
+    }
+  }
+
+  const style = document.createElement("style");
+  style.textContent = `
+    #chainOverlay {
+      position: fixed;
+      bottom: 50px; /* near Chain area */
+      left: 70px;
+      z-index: 2147483647;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-weight: 800;
+      font-size: ${FONT_SIZE}px;
+      line-height: 1;
+      letter-spacing: 2px;
+      color: #ff2b2b;
+      text-shadow: 0 0 2px #000, 0 0 6px rgba(255,0,0,.7), 0 0 12px rgba(255,0,0,.5);
+      pointer-events: none;
+      user-select: none;
+      transition: background-color 0.3s;
+      padding: 4px 12px;
+      border-radius: 8px;
+    }
+    #chainOverlay.flash {
+      background-color: rgba(255,0,0,0.25);
+    }
+  `;
+  document.head.appendChild(style);
+
+  const overlay = document.createElement("div");
+  overlay.id = "chainOverlay";
+  overlay.textContent = "--:--";
+  document.body.appendChild(overlay);
+
+  let apiKey = GM_getValue(API_KEY_NAME, null);
+  let expiresAt = null;
+  let nextPoll = 0;
+  let lastShown = "";
+  let flashedAt = new Set();
+
+  async function ensureApiKey() {
+    if (apiKey) return true;
+    const want = confirm("Enter your Torn API key (stored locally) to show the Chain countdown?");
+    if (!want) return false;
+    const key = prompt("Paste your Torn API key:");
+    if (!key) return false;
+    apiKey = key.trim();
+    GM_setValue(API_KEY_NAME, apiKey);
+    return true;
+  }
+
+  async function pollAPI() {
+    if (!apiKey) return;
+    const url = `https://api.torn.com/faction/?selections=chain&key=${encodeURIComponent(apiKey)}`;
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data?.chain?.timeout && Number(data.chain.timeout) > 0) {
+        expiresAt = Math.floor(Date.now() / 1000) + Number(data.chain.timeout);
+      } else {
+        expiresAt = null;
+      }
+      nextPoll = Math.floor(Date.now() / 1000) + POLL_SECS;
+    } catch (err) {
+      console.error("Chain API error:", err);
+      nextPoll = Math.floor(Date.now() / 1000) + 60;
+    }
+  }
+
+  function flashAndBeep(remain) {
+    if (ALERT_TIMES.includes(remain) && !flashedAt.has(remain)) {
+      flashedAt.add(remain);
+      overlay.classList.add("flash");
+      beep();
+      setTimeout(() => overlay.classList.remove("flash"), 500);
+    }
+  }
+
+  async function tick() {
+    const now = Math.floor(Date.now() / 1000);
+    if (!apiKey) await ensureApiKey();
+
+    if (apiKey && now >= nextPoll) await pollAPI();
+
+    if (expiresAt && expiresAt > now) {
+      const remain = expiresAt - now;
+      overlay.textContent = MMSS(remain);
+      flashAndBeep(remain);
+    } else {
+      overlay.textContent = "--:--";
+      flashedAt.clear();
+    }
+  }
+
+  setInterval(tick, 1000);
+  tick();
+})();
