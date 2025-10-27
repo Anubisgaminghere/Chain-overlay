@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Torn Chain Overlay
-// @namespace    anubis.torn.chain.overlay.fixed
-// @version      1.2.0
-// @description  Fixed big red countdown overlay above Chain area. Auto-updates via Torn API and flashes/beeps at 1:30 and 1:00.
+// @name         A-nub-is Chain Watching
+// @namespace    anubis torn chain overlay v4.3
+// @version      4.3.0
+// @description  Big red chain countdown with smart-sync smoothing, stabilized API polling, fast-polling after hits, and configurable alerts.
 // @match        *://*.torn.com/*
 // @match        *://torn.com/*
 // @run-at       document-idle
@@ -13,125 +13,167 @@
 (function () {
   "use strict";
 
-  const API_KEY_NAME = "torn_api_key";
-  const POLL_SECS = 30;
-  const ALERT_TIMES = [90, 60]; // seconds left (1:30 and 1:00)
-  const FONT_SIZE = 140;
-
-  const MMSS = (secs) => {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${m}:${String(s).padStart(2, "0")}`;
+  const K = {
+    apiKey: "torn_api_key",
+    font: "torn_chain_font",
+    volume: "torn_alert_volume",
+    thresh: "torn_alert_threshold",
+    beepOn: "torn_alert_beep_on",
+    flashOn: "torn_alert_flash_on",
   };
 
-  function beep() {
-    try {
-      const ctx = new AudioContext();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = 660;
-      osc.type = "sine";
-      gain.gain.setValueAtTime(0.1, ctx.currentTime);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.25);
-    } catch (e) {
-      console.warn("Beep failed:", e);
-    }
-  }
+  let apiKey   = GM_getValue(K.apiKey, null);
+  let fontSize = GM_getValue(K.font, 140);
+  let volume   = GM_getValue(K.volume, 0.12);
+  let thresh   = GM_getValue(K.thresh, 90);
+  let beepOn   = GM_getValue(K.beepOn, true);
+  let flashOn  = GM_getValue(K.flashOn, true);
 
-  const style = document.createElement("style");
-  style.textContent = `
-    #chainOverlay {
-      position: fixed;
-      bottom: 50px; /* near Chain area */
-      left: 70px;
-      z-index: 2147483647;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-weight: 800;
-      font-size: ${FONT_SIZE}px;
-      line-height: 1;
-      letter-spacing: 2px;
-      color: #ff2b2b;
-      text-shadow: 0 0 2px #000, 0 0 6px rgba(255,0,0,.7), 0 0 12px rgba(255,0,0,.5);
-      pointer-events: none;
-      user-select: none;
-      transition: background-color 0.3s;
-      padding: 4px 12px;
-      border-radius: 8px;
-    }
-    #chainOverlay.flash {
-      background-color: rgba(255,0,0,0.25);
-    }
-  `;
-  document.head.appendChild(style);
-
-  const overlay = document.createElement("div");
-  overlay.id = "chainOverlay";
-  overlay.textContent = "--:--";
-  document.body.appendChild(overlay);
-
-  let apiKey = GM_getValue(API_KEY_NAME, null);
+  const POLL_SECS_BASE = 10;
+  const POLL_SECS_FAST = 3;
   let expiresAt = null;
-  let nextPoll = 0;
-  let lastShown = "";
-  let flashedAt = new Set();
+  let nextPoll  = 0;
+  let fastPollUntil = 0;
 
-  async function ensureApiKey() {
-    if (apiKey) return true;
-    const want = confirm("Enter your Torn API key (stored locally) to show the Chain countdown?");
-    if (!want) return false;
-    const key = prompt("Paste your Torn API key:");
-    if (!key) return false;
-    apiKey = key.trim();
-    GM_setValue(API_KEY_NAME, apiKey);
-    return true;
+  const css = document.createElement("style");
+  css.textContent = `
+    #tco-fixed{position:fixed;bottom:50px;left:70px;z-index:99999;
+      padding:4px 10px 8px;border-radius:10px;background:rgba(0,0,0,.25);
+      backdrop-filter:blur(2px);user-select:none;transition:background-color .15s ease;}
+    #tco-fixed.alerting{animation:tcoPulse 1s infinite alternate;}
+    @keyframes tcoPulse{0%{background-color:rgba(255,0,0,.12);}100%{background-color:rgba(255,0,0,.35);}}
+    #tco-digits{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:800;
+      font-size:${fontSize}px;color:#ff2b2b;text-shadow:0 0 2px #000,0 0 6px rgba(255,0,0,.7);
+      text-align:center;white-space:nowrap;}
+    #tco-ctrls,#tco-panel,#tco-api{display:flex;gap:6px;justify-content:center;align-items:center;
+      font:12px/1.2 system-ui,sans-serif;color:#fff;margin-top:4px;}
+    #tco-ctrls button,#tco-ctrls a,#tco-panel button,#tco-api button{
+      border:1px solid rgba(255,255,255,.25);background:rgba(0,0,0,.35);
+      color:#fff;padding:2px 6px;border-radius:6px;cursor:pointer;}
+    #tco-panel{display:none;flex-wrap:wrap;row-gap:6px;}
+    #tco-panel label{display:flex;align-items:center;gap:6px;}
+    #tco-panel input[type=text]{width:120px;padding:3px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.3);
+      background:rgba(0,0,0,.2);color:#fff;text-align:center;}
+    #tco-panel input[type=range]{accent-color:#ff2b2b;}
+    #tco-api{display:none;}
+    #tco-api input{width:260px;padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.3);
+      background:rgba(0,0,0,.2);color:#fff;}
+  `;
+  document.head.appendChild(css);
+
+  const box = document.createElement("div");
+  box.id = "tco-fixed";
+  box.innerHTML = `
+    <div id="tco-digits">--:--</div>
+    <div id="tco-ctrls">
+      <button id="sm">–</button><button id="lg">+</button>
+      <a id="alerts" href="#">Alerts</a><button id="ref">↻</button>
+      <a id="api" href="#">${apiKey ? "Edit API" : "Add API"}</a>
+    </div>
+    <div id="tco-panel">
+      <label>Threshold <input id="thr" type="text" placeholder="mm:ss"><button id="thrset">Set</button></label>
+      <label><input id="beep" type="checkbox"> Beep</label>
+      <label><input id="flash" type="checkbox"> Flash</label>
+      <label>Vol <input id="vol" type="range" min="0" max="100"><span id="vlab"></span>
+        <button id="test">Test</button></label>
+      <button id="close">Close</button>
+    </div>
+    <div id="tco-api">
+      <label>API <input id="apiIn" type="password" placeholder="Paste key..."></label>
+      <button id="save">Save</button><button id="cancel">Cancel</button>
+    </div>`;
+  document.body.appendChild(box);
+
+  const d=document;
+  const el=(id)=>d.getElementById(id);
+  const digits=el("tco-digits");
+
+  const sm=el("sm"),lg=el("lg"),ref=el("ref"),alerts=el("alerts"),apiBtn=el("api");
+  const panel=el("tco-panel"),apiPanel=el("tco-api");
+  const thr=el("thr"),thrset=el("thrset"),beep=el("beep"),flash=el("flash"),
+        vol=el("vol"),vlab=el("vlab"),test=el("test"),close=el("close");
+  const apiIn=el("apiIn"),save=el("save"),cancel=el("cancel");
+
+  function setFont(px){fontSize=Math.max(40,Math.min(520,px));digits.style.fontSize=fontSize+"px";GM_setValue(K.font,fontSize);}
+  setFont(fontSize);
+
+  function parseMMSS(v){if(!v)return null;const t=v.trim();if(/^\d+:\d{1,2}$/.test(t)){const[m,s]=t.split(":").map(Number);return m*60+s;}if(/^\d+$/.test(t))return Number(t);return null;}
+  function fmt(s){const m=Math.floor(s/60),x=s%60;return `${m}:${String(x).padStart(2,"0")}`;}
+
+  thr.value=fmt(Math.min(300,thresh));beep.checked=beepOn;flash.checked=flashOn;vol.value=Math.round(volume*100);vlab.textContent=vol.value+"%";
+  if(apiKey)apiIn.value=apiKey;
+
+  let audioCtx=null;
+  function ensureAudio(){try{if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();if(audioCtx.state==="suspended")audioCtx.resume();}catch{}}
+  function beepNow(){if(!beepOn)return;try{ensureAudio();const a=audioCtx.createOscillator(),g=audioCtx.createGain();
+    a.connect(g);g.connect(audioCtx.destination);a.type="sine";a.frequency.value=660;g.gain.value=Math.min(1,volume);a.start();a.stop(audioCtx.currentTime+.22);}catch{}}
+
+  sm.onclick=()=>setFont(fontSize-10);lg.onclick=()=>setFont(fontSize+10);ref.onclick=()=>{nextPoll=0;tick();};
+  alerts.onclick=()=>{apiPanel.style.display="none";panel.style.display=panel.style.display==="flex"?"none":"flex";ensureAudio();};
+  apiBtn.onclick=()=>{panel.style.display="none";apiPanel.style.display=apiPanel.style.display==="flex"?"none":"flex";if(apiPanel.style.display==="flex")apiIn.focus();};
+  thrset.onclick=()=>{const v=parseMMSS(thr.value);thresh=Math.max(0,Math.min(300,v||thresh));GM_setValue(K.thresh,thresh);thr.value=fmt(thresh);};
+  beep.onchange=()=>{beepOn=beep.checked;GM_setValue(K.beepOn,beepOn);};
+  flash.onchange=()=>{flashOn=flash.checked;GM_setValue(K.flashOn,flashOn);};
+  vol.oninput=()=>{volume=Math.max(0,Math.min(1,vol.value/100));vlab.textContent=vol.value+"%";GM_setValue(K.volume,volume);};
+  test.onclick=()=>{ensureAudio();beepNow();};close.onclick=()=>panel.style.display="none";
+  save.onclick=()=>{apiKey=apiIn.value.trim()||null;GM_setValue(K.apiKey,apiKey);apiBtn.textContent=apiKey?"Edit API":"Add API";apiPanel.style.display="none";nextPoll=0;};
+  cancel.onclick=()=>apiPanel.style.display="none";
+
+  window.addEventListener("keydown",e=>{
+    if(!e.shiftKey)return;
+    if(e.code==="Equal"){e.preventDefault();setFont(fontSize+10);}
+    else if(e.code==="Minus"){e.preventDefault();setFont(fontSize-10);}
+    else if(e.code==="KeyC"){e.preventDefault();nextPoll=0;tick();}
+    else if(e.code==="KeyK"){e.preventDefault();apiBtn.click();}
+    else if(e.code==="KeyV"){e.preventDefault();alerts.click();}
+    else if(e.code==="KeyT"){e.preventDefault();ensureAudio();beepNow();}
+  });
+
+  function startA(){if(flashOn)box.classList.add("alerting");}
+  function stopA(){box.classList.remove("alerting");}
+
+  // -------- Smart Sync polling ----------
+  async function pollAPI(){
+    if(!apiKey)return;
+    const url=`https://api.torn.com/faction/?selections=chain&key=${encodeURIComponent(apiKey)}`;
+    try{
+      const res=await fetch(url,{credentials:"omit"});
+      const data=await res.json();
+      const t=Number(data?.chain?.timeout);
+      const now=Math.floor(Date.now()/1000);
+      const old=expiresAt;
+      if(Number.isFinite(t)&&t>0){
+        const newExp=now+t;
+        if(!old){expiresAt=newExp;}
+        else{
+          const diff=newExp-old;
+          if(diff>30){ // big jump up => hit
+            expiresAt=newExp;fastPollUntil=now+20;stopA();
+            console.log(`[ChainTimer] Hit detected +${diff}s`);
+          }else if(Math.abs(diff)<=10){
+            console.log(`[ChainTimer] Ignore small drift (${diff}s)`);
+          }else if(diff<-15){
+            expiresAt=newExp;console.log(`[ChainTimer] Correction (${diff}s)`);
+          }else{
+            expiresAt=newExp;console.log(`[ChainTimer] Sync ${diff}s`);
+          }
+        }
+      }else expiresAt=null;
+      nextPoll=now+((now<fastPollUntil)?POLL_SECS_FAST:POLL_SECS_BASE);
+    }catch(e){console.warn("[ChainTimer] API error:",e);nextPoll=Math.floor(Date.now()/1000)+60;}
   }
+  // --------------------------------------
 
-  async function pollAPI() {
-    if (!apiKey) return;
-    const url = `https://api.torn.com/faction/?selections=chain&key=${encodeURIComponent(apiKey)}`;
-    try {
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data?.chain?.timeout && Number(data.chain.timeout) > 0) {
-        expiresAt = Math.floor(Date.now() / 1000) + Number(data.chain.timeout);
-      } else {
-        expiresAt = null;
-      }
-      nextPoll = Math.floor(Date.now() / 1000) + POLL_SECS;
-    } catch (err) {
-      console.error("Chain API error:", err);
-      nextPoll = Math.floor(Date.now() / 1000) + 60;
-    }
+  async function tick(){
+    const now=Math.floor(Date.now()/1000);
+    if(apiKey&&now>=nextPoll)await pollAPI();
+    if(expiresAt&&expiresAt>now){
+      const remain=expiresAt-now;
+      digits.textContent=fmt(remain);
+      if(remain<=Math.max(0,Math.min(300,thresh))){startA();if(beepOn)beepNow();}
+      else stopA();
+      if(remain<=120)ensureAudio();
+    }else{digits.textContent="--:--";stopA();}
   }
-
-  function flashAndBeep(remain) {
-    if (ALERT_TIMES.includes(remain) && !flashedAt.has(remain)) {
-      flashedAt.add(remain);
-      overlay.classList.add("flash");
-      beep();
-      setTimeout(() => overlay.classList.remove("flash"), 500);
-    }
-  }
-
-  async function tick() {
-    const now = Math.floor(Date.now() / 1000);
-    if (!apiKey) await ensureApiKey();
-
-    if (apiKey && now >= nextPoll) await pollAPI();
-
-    if (expiresAt && expiresAt > now) {
-      const remain = expiresAt - now;
-      overlay.textContent = MMSS(remain);
-      flashAndBeep(remain);
-    } else {
-      overlay.textContent = "--:--";
-      flashedAt.clear();
-    }
-  }
-
-  setInterval(tick, 1000);
-  tick();
+  setInterval(tick,1000);tick();
 })();
